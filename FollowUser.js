@@ -17,14 +17,12 @@
   const enmity = window.enmity;
   const NAME = 'FollowUser';
 
-  const { React, FluxDispatcher, Toasts } = enmity.modules.common;
+  const { React, Toasts } = enmity.modules.common;
   const { FormRow, FormSwitch, FormInput, FormSection, FormDivider, ScrollView } = enmity.components;
   const h = React.createElement;
 
-  // Valeurs des enums de l'API Discord utilisées par les commandes Enmity
-  const ApplicationCommandType = { Chat: 1 };
-  const ApplicationCommandInputType = { BuiltInText: 1 };
-  const ApplicationCommandOptionType = { User: 6 };
+  // Valeur de l'enum ApplicationCommandOptionType de Discord
+  const OPTION_TYPE_USER = 6;
 
   const DEFAULTS = {
     targetId: '',
@@ -37,7 +35,8 @@
   const getSetting = (key) => enmity.settings.get(NAME, key, DEFAULTS[key]);
   const setSetting = (key, value) => enmity.settings.set(NAME, key, value);
 
-  let UserStore, ChannelStore, VoiceStateStore, SelectedChannelStore, VoiceActions;
+  let Dispatcher, UserStore, ChannelStore, VoiceStateStore, SelectedChannelStore, VoiceActions;
+  let subscribed = false;
   let lastTargetChannel = null;
 
   // Essaie plusieurs combinaisons de props, au cas où Discord renomme un module
@@ -49,8 +48,24 @@
     return null;
   }
 
-  function toast(content) {
-    if (!getSetting('showToasts')) return;
+  // Résolus à la demande : un module introuvable ne doit pas empêcher les commandes d'apparaître
+  function loadModules() {
+    Dispatcher = Dispatcher || enmity.modules.common.Dispatcher || findModule(['dispatch', 'subscribe']);
+    UserStore = UserStore || findModule(['getCurrentUser', 'getUser']);
+    ChannelStore = ChannelStore || findModule(['getChannel', 'getDMFromUserId'], ['getChannel']);
+    VoiceStateStore = VoiceStateStore || findModule(['getVoiceStateForUser'], ['getVoiceStatesForChannel']);
+    SelectedChannelStore = SelectedChannelStore || findModule(['getVoiceChannelId', 'getChannelId'], ['getVoiceChannelId']);
+    VoiceActions = VoiceActions || findModule(['selectVoiceChannel', 'disconnect'], ['selectVoiceChannel']);
+
+    const missing = Object.entries({ Dispatcher, UserStore, ChannelStore, VoiceStateStore, SelectedChannelStore, VoiceActions })
+      .filter(([, mod]) => !mod)
+      .map(([name]) => name);
+    if (missing.length) console.log(`[${NAME}] modules introuvables : ${missing.join(', ')}`);
+    return missing;
+  }
+
+  function toast(content, force) {
+    if (!force && !getSetting('showToasts')) return;
     try {
       let source;
       for (const icon of ['ic_voice_channel_24px', 'Check']) {
@@ -61,6 +76,17 @@
     } catch (e) {
       console.log(`[${NAME}] toast impossible`, e);
     }
+  }
+
+  // Réponse visible seulement par toi (message de Clyde) dans le salon de la commande
+  function reply(message, content) {
+    const channelId = message && message.channel && message.channel.id;
+    try {
+      if (channelId && enmity.clyde) return enmity.clyde.sendReply(channelId, content);
+    } catch (e) {
+      console.log(`[${NAME}] réponse impossible`, e);
+    }
+    toast(content, true);
   }
 
   function getUserName(id) {
@@ -141,69 +167,67 @@
     }
   }
 
+  // Renvoie le texte à afficher à l'utilisateur
   function follow(id) {
     const me = UserStore.getCurrentUser();
-    if (me && me.id === id) {
-      toast('Tu ne peux pas te suivre toi-même');
-      return;
-    }
+    if (me && me.id === id) return 'Tu ne peux pas te suivre toi-même.';
 
     setSetting('targetId', id);
     syncTargetChannel();
-    toast(`Tu suis maintenant ${getUserName(id)}`);
 
-    if (getSetting('joinOnFollow') && lastTargetChannel && lastTargetChannel !== SelectedChannelStore.getVoiceChannelId()) {
+    const myChannel = SelectedChannelStore.getVoiceChannelId();
+    if (getSetting('joinOnFollow') && lastTargetChannel && lastTargetChannel !== myChannel) {
       joinChannel(lastTargetChannel);
     }
+
+    const where = lastTargetChannel ? 'Il est en vocal en ce moment.' : "Il n'est pas en vocal pour l'instant.";
+    return `Tu suis maintenant **${getUserName(id)}**. ${where}`;
   }
 
   function unfollow() {
     const targetId = getSetting('targetId');
     setSetting('targetId', '');
     lastTargetChannel = null;
-    toast(targetId ? `Tu ne suis plus ${getUserName(targetId)}` : 'Tu ne suivais personne');
+    return targetId ? `Tu ne suis plus **${getUserName(targetId)}**.` : 'Tu ne suivais personne.';
   }
 
+  // Pas d'id, de type ni d'inputType : Enmity attribue lui-même ceux attendus par Discord
   const commands = [
     {
-      id: 'followuser-follow',
       name: 'follow',
       displayName: 'follow',
       description: 'Suivre automatiquement un utilisateur dans les salons vocaux',
       displayDescription: 'Suivre automatiquement un utilisateur dans les salons vocaux',
-      type: ApplicationCommandType.Chat,
-      inputType: ApplicationCommandInputType.BuiltInText,
       options: [
         {
           name: 'user',
           displayName: 'user',
           description: "L'utilisateur à suivre",
           displayDescription: "L'utilisateur à suivre",
-          type: ApplicationCommandOptionType.User,
+          type: OPTION_TYPE_USER,
           required: true,
         },
       ],
-      execute(args) {
+      execute(args, message) {
+        const missing = loadModules();
+        if (missing.length) return reply(message, `${NAME} ne marche pas sur cette version de Discord (introuvable : ${missing.join(', ')}).`);
+
         const arg = (args || []).find((a) => a.name === 'user');
         const id = arg ? String(arg.value).replace(/\D/g, '') : '';
-        if (!id) {
-          toast('Utilisateur invalide');
-          return;
-        }
-        follow(id);
+        if (!id) return reply(message, 'Utilisateur invalide.');
+
+        reply(message, follow(id));
       },
     },
     {
-      id: 'followuser-unfollow',
       name: 'unfollow',
       displayName: 'unfollow',
       description: "Arrêter de suivre l'utilisateur",
       displayDescription: "Arrêter de suivre l'utilisateur",
-      type: ApplicationCommandType.Chat,
-      inputType: ApplicationCommandInputType.BuiltInText,
       options: [],
-      execute() {
-        unfollow();
+      execute(args, message) {
+        loadModules();
+        reply(message, unfollow());
       },
     },
   ];
@@ -240,7 +264,7 @@
         h(FormRow, {
           label: targetId ? `Suivi : ${getUserName(targetId)}` : "Personne n'est suivi",
           subLabel: targetId ? 'Appuie pour arrêter de suivre' : 'Utilise /follow ou entre un ID ci-dessus',
-          onPress: targetId ? unfollow : undefined,
+          onPress: targetId ? () => toast(unfollow(), true) : undefined,
         })
       ),
       h(
@@ -259,32 +283,36 @@
 
   const FollowUser = {
     name: NAME,
-    version: '1.0.0',
+    version: '1.0.1',
     description: 'Suit automatiquement un utilisateur dans les salons vocaux.',
     authors: [{ name: 'NANODLAPISCINE', id: '000000000000000000' }], // remplace par ton ID Discord
     color: '#5865F2',
 
     onStart() {
-      UserStore = findModule(['getCurrentUser', 'getUser']);
-      ChannelStore = findModule(['getChannel', 'getDMFromUserId'], ['getChannel']);
-      VoiceStateStore = findModule(['getVoiceStateForUser'], ['getVoiceStatesForChannel']);
-      SelectedChannelStore = findModule(['getVoiceChannelId', 'getChannelId'], ['getVoiceChannelId']);
-      VoiceActions = findModule(['selectVoiceChannel', 'disconnect'], ['selectVoiceChannel']);
+      // En premier, pour que les commandes apparaissent même si la suite échoue.
+      // Une commande par appel : Enmity donne alors un id distinct à chacune.
+      for (const command of commands) enmity.commands.registerCommands(NAME, [command]);
 
-      if (!UserStore || !ChannelStore || !VoiceStateStore || !SelectedChannelStore || !VoiceActions) {
-        console.log(`[${NAME}] modules Discord introuvables, plugin désactivé`);
-        toast(`${NAME} : version de Discord non supportée`);
-        return;
+      try {
+        const missing = loadModules();
+        if (missing.length) {
+          toast(`${NAME} : version de Discord non supportée (${missing.join(', ')})`, true);
+          return;
+        }
+
+        syncTargetChannel();
+        Dispatcher.subscribe('VOICE_STATE_UPDATES', onVoiceStateUpdates);
+        subscribed = true;
+      } catch (e) {
+        console.log(`[${NAME}] erreur au démarrage`, e);
+        toast(`${NAME} : erreur au démarrage (${e.message})`, true);
       }
-
-      syncTargetChannel();
-      FluxDispatcher.subscribe('VOICE_STATE_UPDATES', onVoiceStateUpdates);
-      enmity.commands.registerCommands(NAME, commands);
     },
 
     onStop() {
-      FluxDispatcher.unsubscribe('VOICE_STATE_UPDATES', onVoiceStateUpdates);
       enmity.commands.unregisterCommands(NAME);
+      if (subscribed) Dispatcher.unsubscribe('VOICE_STATE_UPDATES', onVoiceStateUpdates);
+      subscribed = false;
       lastTargetChannel = null;
     },
 
